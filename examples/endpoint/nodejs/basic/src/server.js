@@ -112,7 +112,8 @@ function isRequestSignatureValid(req) {
 }
 
 // --- AJOUT n8n Flow Backend ---
-import fetch from "node-fetch";
+// import fetch from "node-fetch";
+
 
 const {
   N8N_WEBHOOK_DATA,
