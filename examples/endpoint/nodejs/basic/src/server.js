@@ -110,3 +110,63 @@ function isRequestSignatureValid(req) {
   }
   return true;
 }
+
+// --- AJOUT n8n Flow Backend ---
+import fetch from "node-fetch";
+
+const {
+  N8N_WEBHOOK_DATA,
+  N8N_WEBHOOK_VALIDATE,
+  N8N_WEBHOOK_SUBMIT,
+  N8N_SHARED_SECRET,
+} = process.env;
+
+async function callN8n(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-shared-secret": N8N_SHARED_SECRET || "",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`n8n error ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+app.get("/flow/data", async (req, res) => {
+  try {
+    const { wa_id, step, locale } = req.query;
+    const data = await callN8n(N8N_WEBHOOK_DATA, { wa_id, step, locale });
+    res.json({ success: true, ...data });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "DATA_FAILED" });
+  }
+});
+
+app.post("/flow/validate", async (req, res) => {
+  try {
+    const { wa_id, step, inputs } = req.body;
+    const data = await callN8n(N8N_WEBHOOK_VALIDATE, { wa_id, step, inputs });
+    res.json({ success: true, ...data });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "VALIDATION_FAILED" });
+  }
+});
+
+app.post("/flow/submit", async (req, res) => {
+  try {
+    const { wa_id, payload } = req.body;
+    const data = await callN8n(N8N_WEBHOOK_SUBMIT, { wa_id, payload });
+    res.json({ success: true, ...data });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ success: false, error: "SUBMIT_FAILED" });
+  }
+});
+
