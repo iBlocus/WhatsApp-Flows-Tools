@@ -169,4 +169,107 @@ app.post("/flow/submit", async (req, res) => {
     res.status(500).json({ success: false, error: "SUBMIT_FAILED" });
   }
 });
+  // --- Internal Flow Cache for daily tasks ---
+const flowCache = new Map();
+const FLOW_ADMIN_TOKEN = process.env.FLOW_ADMIN_TOKEN;
 
+// Endpoint for n8n to push daily tasks for a user.
+// Expects JSON { phone: "...", etudiant: "...", tasks_list: [ { id, title }, ... ] }
+// Protected via Bearer token header Authorization: Bearer <FLOW_ADMIN_TOKEN>
+app.post('/internal/flows/daily', express.json(), (req, res) => {
+  const auth = req.headers.authorization || '';
+  if (!FLOW_ADMIN_TOKEN || auth !== `Bearer ${FLOW_ADMIN_TOKEN}`) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const { phone, etudiant, tasks_list } = req.body || {};
+  if ((!phone && !etudiant) || !Array.isArray(tasks_list)) {
+    return res.status(400).json({ error: 'bad_payload', hint: 'need phone or etudiant + tasks_list[]' });
+  }
+  // Normalize key: remove whatsapp: prefix and leading +
+  let key = String(phone || etudiant).replace(/^whatsapp:/, '');
+  if (key.startsWith('+')) key = key.slice(1);
+  flowCache.set(key, { tasks_list, updatedAt: Date.now() });
+  return res.json({ ok: true });
+});
+
+// Helper to extract user phone/id from Meta payload.
+// Supports multiple possible fields like contacts[0].wa_id, context.from, user.phone, etc.
+function extractUserKeyFromMetaBody(body) {
+  const candidates = [
+    body?.contacts?.[0]?.wa_id,
+    body?.context?.from,
+    body?.user?.phone,
+    body?.from,
+    body?.customer?.phone,
+    body?.phone,
+  ].filter(Boolean);
+  if (!candidates.length) return null;
+  let norm = String(candidates[0]).replace(/^whatsapp:/, '');
+  if (norm.startsWith('+')) norm = norm.slice(1);
+  return norm;
+}
+
+// Endpoint called by Meta to fetch the flow for a particular user.
+// It looks up tasks_list from the flowCache using the extracted phone/id.
+app.post('/flow/student', express.json(), (req, res) => {
+  const userKey = extractUserKeyFromMetaBody(req.body);
+  if (!userKey) {
+    return res.status(400).json({ error: 'cannot_identify_user', hint: 'no phone/wa_id in payload' });
+  }
+  // Try to find data by key, or key with leading '+' if stored that way.
+  const data = flowCache.get(userKey) || flowCache.get('+' + userKey) || null;
+  const tasks = data?.tasks_list || [];
+  const options = tasks.map(t => ({ id: String(t.id), title: t.title }));
+  const hasTasks = options.length > 0;
+
+  const screen = {
+    data: {},
+    id: 'QUESTION_ONE',
+    layout: {
+      type: 'SingleColumnLayout',
+      children: [
+        {
+          type: 'Form',
+          name: 'flow_path',
+          children: [
+            {
+              type: 'TextHeading',
+              text: hasTasks ? "Qu'as-tu réussi à faire aujourd'hui ?" : "Aucune tâche trouvée pour aujourd'hui 😕",
+            },
+            hasTasks
+              ? {
+                  type: 'CheckboxGroup',
+                  label: 'Choisis les tâches accomplies',
+                  required: false,
+                  name: 'tasks_accomplished',
+                  'data-source': options,
+                }
+              : {
+                  type: 'TextSubheading',
+                  text: 'Réessaie plus tard ou contacte le support.',
+                },
+            {
+              type: 'Footer',
+              label: hasTasks ? 'Soumettre' : 'Fermer',
+              'on-click-action': hasTasks
+                ? {
+                    name: 'complete',
+                    payload: { completed_tasks: '${form.tasks_accomplished}' },
+                  }
+                : { name: 'complete', payload: {} },
+            },
+          ],
+        },
+      ],
+    },
+    terminal: true,
+    title: 'Suivi des tâches',
+  };
+
+  return res.json({
+    data_api_version: '3.0',
+    routing_model: { QUESTION_ONE: [] },
+    screens: [screen],
+    version: '7.2',
+  });
+});
