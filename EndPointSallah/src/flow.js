@@ -1,22 +1,44 @@
 // src/flow.js
-import { n8nGetTasks, n8nSubmitResult } from "./integrations/n8nClient.js";
+import { n8nSubmitResult } from "./integrations/n8nClient.js";
 
 const DAYS = ["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"];
 
-function buildSelectJourScreen(dayOptions = DAYS) {
-  return {
-    screen: "SELECT_JOUR",
-    data: {
-      day_options: dayOptions.map(d => ({ id: d, title: d.charAt(0)+d.slice(1).toLowerCase() }))
+// Mémoire par flow_token (volatile, suffit pour un POC)
+const flowState = new Map();
+
+function normDayKey(k) {
+  if (!k) return null;
+  const u = k.toString().trim().toUpperCase();
+  // Autorise "Lundi"/"lundi" etc.
+  if (["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"].includes(u)) return u;
+  const map = { LUNDI:"LUNDI", MARDI:"MARDI", MERCREDI:"MERCREDI", JEUDI:"JEUDI", VENDREDI:"VENDREDI", SAMEDI:"SAMEDI", DIMANCHE:"DIMANCHE" };
+  const cap = u.charAt(0) + u.slice(1).toLowerCase();
+  return map[cap?.toUpperCase()] || null;
+}
+
+function normalizeTasksByDay(input) {
+  if (!input || typeof input !== "object") return null;
+  const out = {};
+  for (const [k, v] of Object.entries(input)) {
+    const day = normDayKey(k);
+    if (!day) continue;
+    if (Array.isArray(v)) {
+      out[day] = v
+        .filter(x => x && typeof x === "object")
+        .map(x => ({ id: String(x.id), title: String(x.title) }));
     }
-  };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function buildSelectJourScreen(dayOptions) {
+  const opts = (dayOptions && dayOptions.length ? dayOptions : DAYS)
+    .map(d => ({ id: d, title: d.charAt(0) + d.slice(1).toLowerCase() }));
+  return { screen: "SELECT_JOUR", data: { day_options: opts } };
 }
 
 function buildDayScreen(dayId, tasks = []) {
-  return {
-    screen: dayId,
-    data: { tasks }
-  };
+  return { screen: dayId, data: { tasks } };
 }
 
 function buildSuccess(flow_token, dayId, completed = []) {
@@ -39,57 +61,33 @@ export const getNextScreen = async (decryptedBody) => {
 
   if (action === "ping") return { data: { status: "active" } };
 
-  // INIT = ouverture du flow
   if (action === "INIT") {
-    // 1) Traite l'input initial fourni par ton message (optionnel)
-    const initialData = data || null;
+    // On récupère ce que n8n a poussé dans le message
+    const inbound = data || {};
+    let tasksByDay = normalizeTasksByDay(inbound.tasks_by_day);
 
-    // 2) Tente de demander à n8n un "catalogue" de tâches (par jour)
-    let tasksByDay = null;
-    try {
-      const n8nResp = await n8nGetTasks({
-        flow_token,
-        screen: "INIT",
-        day: null,
-        initial_data: initialData
-      });
-      // attendu: { tasks_by_day: { LUNDI:[{id,title}], ... } } OU rien
-      tasksByDay = n8nResp?.tasks_by_day || null;
-    } catch (e) {
-      console.warn("n8nGetTasks INIT error:", e?.message);
+    // Fallback : si n8n a envoyé seulement un jour actuel
+    if (!tasksByDay && Array.isArray(inbound.tasks)) {
+      const d = normDayKey(inbound.day || inbound.selected_day || inbound.default_day);
+      if (d) tasksByDay = { [d]: inbound.tasks.map(x => ({ id: String(x.id), title: String(x.title) })) };
     }
 
-    // 3) Si tu veux forcer le choix du jour d'abord (recommandé)
-    //    tu peux aussi, si tasksByDay est déjà rempli, précharger côté SELECT_JOUR (pas indispensable).
-    return buildSelectJourScreen();
+    flowState.set(flow_token, { tasksByDay: tasksByDay || {} });
+
+    const available = tasksByDay ? Object.keys(tasksByDay) : DAYS;
+    return buildSelectJourScreen(available);
   }
 
   if (action === "data_exchange") {
     switch (screen) {
       case "SELECT_JOUR": {
-        const chosen = data?.selected_day;
-        if (!DAYS.includes(chosen)) throw new Error(`Jour invalide: ${chosen}`);
-
-        // Demande à n8n uniquement les tâches de ce jour (optionnel)
-        let tasks = [];
-        try {
-          const n8nResp = await n8nGetTasks({
-            flow_token,
-            screen: "SELECT_JOUR",
-            day: chosen,
-            initial_data: null
-          });
-          // attendu: { tasks: [{id,title}, ...] } OU { tasks_by_day: {...} }
-          if (Array.isArray(n8nResp?.tasks)) tasks = n8nResp.tasks;
-          else if (n8nResp?.tasks_by_day?.[chosen]) tasks = n8nResp.tasks_by_day[chosen];
-        } catch (e) {
-          console.warn("n8nGetTasks SELECT_JOUR error:", e?.message);
-        }
-
+        const chosen = normDayKey(data?.selected_day);
+        if (!chosen) throw new Error(`Jour invalide: ${data?.selected_day}`);
+        const state = flowState.get(flow_token);
+        const tasks = state?.tasksByDay?.[chosen] || [];
         return buildDayScreen(chosen, tasks);
       }
 
-      // Tous les écrans "jour"
       case "LUNDI":
       case "MARDI":
       case "MERCREDI":
@@ -97,19 +95,22 @@ export const getNextScreen = async (decryptedBody) => {
       case "VENDREDI":
       case "SAMEDI":
       case "DIMANCHE": {
-        const dayId = data?.day || screen;
+        const dayId = normDayKey(data?.day) || screen;
         const completed = Array.isArray(data?.completed_tasks) ? data.completed_tasks : [];
 
-        // Envoi à n8n pour enregistrement
+        // Envoi à n8n (réception via ton webhook)
         try {
           await n8nSubmitResult({
             flow_token,
             day: dayId,
             completed_tasks: completed,
-            raw: { screen, data } // si tu veux tout logguer côté n8n
+            raw: { screen, data }
           });
         } catch (e) {
           console.warn("n8nSubmitResult error:", e?.message);
+        } finally {
+          // petite hygiène mémoire
+          flowState.delete(flow_token);
         }
 
         return buildSuccess(flow_token, dayId, completed);
@@ -122,4 +123,3 @@ export const getNextScreen = async (decryptedBody) => {
 
   throw new Error("Requête non gérée (action/screen)");
 };
-
