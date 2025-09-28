@@ -1,1 +1,17 @@
+{
+  "name": "whatsapp-flow-endpoint",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "keys": "node src/keyGenerator.js SallahEndpointMAX!"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  }
+}
 
