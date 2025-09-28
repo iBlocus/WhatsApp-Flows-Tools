@@ -1,23 +1,21 @@
-// src/flow.js
+// src/flow.js — Semaine séquentielle sans SELECT_JOUR (LUNDI→...→DIMANCHE→SUCCESS)
 import { n8nSubmitResult } from "./integrations/n8nClient.js";
 
-const DAYS = ["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"];
-
-// Mémoire par flow_token (volatile, suffit pour un POC)
-const flowState = new Map();
+const ORDER = ["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"];
+const DAYS = new Set(ORDER);
+const nextDayOf = (day) => {
+  const i = ORDER.indexOf(day);
+  return i >= 0 && i < ORDER.length - 1 ? ORDER[i + 1] : null;
+};
 
 function normDayKey(k) {
   if (!k) return null;
   const u = k.toString().trim().toUpperCase();
-  // Autorise "Lundi"/"lundi" etc.
-  if (["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"].includes(u)) return u;
-  const map = { LUNDI:"LUNDI", MARDI:"MARDI", MERCREDI:"MERCREDI", JEUDI:"JEUDI", VENDREDI:"VENDREDI", SAMEDI:"SAMEDI", DIMANCHE:"DIMANCHE" };
-  const cap = u.charAt(0) + u.slice(1).toLowerCase();
-  return map[cap?.toUpperCase()] || null;
+  return DAYS.has(u) ? u : null;
 }
 
 function normalizeTasksByDay(input) {
-  if (!input || typeof input !== "object") return null;
+  if (!input || typeof input !== "object") return {};
   const out = {};
   for (const [k, v] of Object.entries(input)) {
     const day = normDayKey(k);
@@ -28,97 +26,85 @@ function normalizeTasksByDay(input) {
         .map(x => ({ id: String(x.id), title: String(x.title) }));
     }
   }
-  return Object.keys(out).length ? out : null;
-}
-
-function buildSelectJourScreen(dayOptions) {
-  const opts = (dayOptions && dayOptions.length ? dayOptions : DAYS)
-    .map(d => ({ id: d, title: d.charAt(0) + d.slice(1).toLowerCase() }));
-  return { screen: "SELECT_JOUR", data: { day_options: opts } };
+  return out;
 }
 
 function buildDayScreen(dayId, tasks = []) {
   return { screen: dayId, data: { tasks } };
 }
 
-function buildSuccess(flow_token, dayId, completed = []) {
+function buildSuccess(flow_token, week_start_iso, summary = {}) {
   return {
     screen: "SUCCESS",
     data: {
+      // Tu peux lire ces params dans l’Extension Message si besoin
       extension_message_response: {
         params: {
           flow_token,
-          day: dayId,
-          completed_count: String(Array.isArray(completed) ? completed.length : 0)
+          week_start_iso: week_start_iso || "",
+          ...summary
         }
       }
     }
   };
 }
 
+// Mémoire par flow_token (volatile)
+const flowState = new Map(); // flow_token -> { tasksByDay, weekStartISO }
+
 export const getNextScreen = async (decryptedBody) => {
   const { screen, data, action, flow_token } = decryptedBody;
 
   if (action === "ping") return { data: { status: "active" } };
 
+  // OUVERTURE (toujours le dimanche côté n8n). On force le départ à LUNDI.
   if (action === "INIT") {
-    // On récupère ce que n8n a poussé dans le message
+    // n8n pousse toute la semaine suivante :
+    // data = { week_start_iso: "2025-09-29", tasks_by_day: { LUNDI:[...], ..., DIMANCHE:[...] }, ...}
     const inbound = data || {};
-    let tasksByDay = normalizeTasksByDay(inbound.tasks_by_day);
+    const tasksByDay = normalizeTasksByDay(inbound.tasks_by_day || {});
+    const weekStartISO = typeof inbound.week_start_iso === "string" ? inbound.week_start_iso : "";
 
-    // Fallback : si n8n a envoyé seulement un jour actuel
-    if (!tasksByDay && Array.isArray(inbound.tasks)) {
-      const d = normDayKey(inbound.day || inbound.selected_day || inbound.default_day);
-      if (d) tasksByDay = { [d]: inbound.tasks.map(x => ({ id: String(x.id), title: String(x.title) })) };
-    }
+    flowState.set(flow_token, { tasksByDay, weekStartISO });
 
-    flowState.set(flow_token, { tasksByDay: tasksByDay || {} });
-
-    const available = tasksByDay ? Object.keys(tasksByDay) : DAYS;
-    return buildSelectJourScreen(available);
+    // on commence par LUNDI
+    const mondayTasks = tasksByDay["LUNDI"] || [];
+    return buildDayScreen("LUNDI", mondayTasks);
   }
 
-  if (action === "data_exchange") {
-    switch (screen) {
-      case "SELECT_JOUR": {
-        const chosen = normDayKey(data?.selected_day);
-        if (!chosen) throw new Error(`Jour invalide: ${data?.selected_day}`);
-        const state = flowState.get(flow_token);
-        const tasks = state?.tasksByDay?.[chosen] || [];
-        return buildDayScreen(chosen, tasks);
-      }
+  // INTERACTIONS UTILISATEUR (1 écran par jour)
+  if (action === "data_exchange" && DAYS.has(screen)) {
+    const dayId = normDayKey(data?.day) || screen;
+    const modify = Array.isArray(data?.modify_tasks) ? data.modify_tasks : []; // ← CHANGEMENT ICI
+    const state = flowState.get(flow_token) || { tasksByDay: {}, weekStartISO: "" };
 
-      case "LUNDI":
-      case "MARDI":
-      case "MERCREDI":
-      case "JEUDI":
-      case "VENDREDI":
-      case "SAMEDI":
-      case "DIMANCHE": {
-        const dayId = normDayKey(data?.day) || screen;
-        const completed = Array.isArray(data?.completed_tasks) ? data.completed_tasks : [];
-
-        // Envoi à n8n (réception via ton webhook)
-        try {
-          await n8nSubmitResult({
-            flow_token,
-            day: dayId,
-            completed_tasks: completed,
-            raw: { screen, data }
-          });
-        } catch (e) {
-          console.warn("n8nSubmitResult error:", e?.message);
-        } finally {
-          // petite hygiène mémoire
-          flowState.delete(flow_token);
+    // Enregistrer côté n8n (même si vide = "passer")
+    try {
+      await n8nSubmitResult({
+        flow_token,
+        day: dayId,
+        completed_tasks: modify, // on réutilise le champ existant côté client n8n
+        raw: {
+          event: "MODIFY",
+          week_start_iso: state.weekStartISO,
+          screen,
+          data
         }
-
-        return buildSuccess(flow_token, dayId, completed);
-      }
-
-      default:
-        throw new Error(`Écran non géré: ${screen}`);
+      });
+    } catch (e) {
+      console.warn("n8nSubmitResult error:", e?.message);
     }
+
+    const next = nextDayOf(dayId);
+    if (!next) {
+      // Dernier jour (DIMANCHE) → SUCCESS
+      flowState.delete(flow_token);
+      return buildSuccess(flow_token, state.weekStartISO);
+    }
+
+    // Affiche le prochain jour avec ses tâches
+    const nextTasks = state.tasksByDay[next] || [];
+    return buildDayScreen(next, nextTasks);
   }
 
   throw new Error("Requête non gérée (action/screen)");
