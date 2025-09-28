@@ -1,5 +1,5 @@
-// src/flow.js — Semaine séquentielle sans SELECT_JOUR (LUNDI→...→DIMANCHE→SUCCESS)
-import { n8nSubmitResult } from "./integrations/n8nClient.js";
+// src/flow.js — Agrégation semaine (un seul POST final vers n8n)
+import { n8nSubmitWeek } from "./integrations/n8nClient.js";
 
 const ORDER = ["LUNDI","MARDI","MERCREDI","JEUDI","VENDREDI","SAMEDI","DIMANCHE"];
 const DAYS = new Set(ORDER);
@@ -33,78 +33,82 @@ function buildDayScreen(dayId, tasks = []) {
   return { screen: dayId, data: { tasks } };
 }
 
-function buildSuccess(flow_token, week_start_iso, summary = {}) {
+function buildSuccess(flow_token, week_start_iso, selections) {
+  const summary_counts = Object.fromEntries(
+    ORDER.map(d => [d, Array.isArray(selections?.[d]) ? selections[d].length : 0])
+  );
   return {
     screen: "SUCCESS",
     data: {
-      // Tu peux lire ces params dans l’Extension Message si besoin
       extension_message_response: {
         params: {
           flow_token,
           week_start_iso: week_start_iso || "",
-          ...summary
+          ...summary_counts
         }
       }
     }
   };
 }
 
-// Mémoire par flow_token (volatile)
-const flowState = new Map(); // flow_token -> { tasksByDay, weekStartISO }
+// Mémoire par flow_token (volatile ; pour la prod multi-instance, utilise Redis/DB)
+const flowState = new Map(); // flow_token -> { tasksByDay, weekStartISO, selections, context }
 
 export const getNextScreen = async (decryptedBody) => {
   const { screen, data, action, flow_token } = decryptedBody;
 
   if (action === "ping") return { data: { status: "active" } };
 
-  // OUVERTURE (toujours le dimanche côté n8n). On force le départ à LUNDI.
+  // OUVERTURE (le message est envoyé le dimanche, on démarre à LUNDI)
   if (action === "INIT") {
-    // n8n pousse toute la semaine suivante :
-    // data = { week_start_iso: "2025-09-29", tasks_by_day: { LUNDI:[...], ..., DIMANCHE:[...] }, ...}
     const inbound = data || {};
     const tasksByDay = normalizeTasksByDay(inbound.tasks_by_day || {});
     const weekStartISO = typeof inbound.week_start_iso === "string" ? inbound.week_start_iso : "";
+    const context = inbound.context || null;
 
-    flowState.set(flow_token, { tasksByDay, weekStartISO });
+    flowState.set(flow_token, {
+      tasksByDay,
+      weekStartISO,
+      selections: {}, // { LUNDI:[ids], ... }
+      context
+    });
 
-    // on commence par LUNDI
-    const mondayTasks = tasksByDay["LUNDI"] || [];
-    return buildDayScreen("LUNDI", mondayTasks);
+    return buildDayScreen("LUNDI", tasksByDay["LUNDI"] || []);
   }
 
-  // INTERACTIONS UTILISATEUR (1 écran par jour)
+  // INTERACTIONS PAR JOUR
   if (action === "data_exchange" && DAYS.has(screen)) {
-    const dayId = normDayKey(data?.day) || screen;
-    const modify = Array.isArray(data?.modify_tasks) ? data.modify_tasks : []; // ← CHANGEMENT ICI
-    const state = flowState.get(flow_token) || { tasksByDay: {}, weekStartISO: "" };
+    const state = flowState.get(flow_token);
+    if (!state) throw new Error("Session introuvable");
 
-    // Enregistrer côté n8n (même si vide = "passer")
-    try {
-      await n8nSubmitResult({
-        flow_token,
-        day: dayId,
-        completed_tasks: modify, // on réutilise le champ existant côté client n8n
-        raw: {
-          event: "MODIFY",
-          week_start_iso: state.weekStartISO,
-          screen,
-          data
-        }
-      });
-    } catch (e) {
-      console.warn("n8nSubmitResult error:", e?.message);
-    }
+    const dayId = normDayKey(data?.day) || screen;
+    const modify = Array.isArray(data?.modify_tasks) ? data.modify_tasks : [];
+
+    // on agrège
+    state.selections[dayId] = modify;
 
     const next = nextDayOf(dayId);
     if (!next) {
-      // Dernier jour (DIMANCHE) → SUCCESS
-      flowState.delete(flow_token);
-      return buildSuccess(flow_token, state.weekStartISO);
+      // Fin de semaine → 1 seul POST vers n8n avec tout le package
+      try {
+        await n8nSubmitWeek({
+          flow_token,
+          week_start_iso: state.weekStartISO,
+          selections: state.selections,
+          tasks_by_day: state.tasksByDay,
+          context: state.context
+        });
+      } catch (e) {
+        console.warn("n8nSubmitWeek error:", e?.message);
+      } finally {
+        flowState.delete(flow_token);
+      }
+
+      return buildSuccess(flow_token, state.weekStartISO, state.selections);
     }
 
-    // Affiche le prochain jour avec ses tâches
-    const nextTasks = state.tasksByDay[next] || [];
-    return buildDayScreen(next, nextTasks);
+    // sinon, on affiche le jour suivant
+    return buildDayScreen(next, state.tasksByDay[next] || []);
   }
 
   throw new Error("Requête non gérée (action/screen)");
